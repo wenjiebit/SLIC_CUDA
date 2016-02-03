@@ -21,11 +21,13 @@
 #include <opencv2/opencv.hpp>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include <helper_cuda.h>
 #include "funUtils.h"
 
 
-#define N_ITER 1 // Kmean iteration
+#define N_ITER 5 // Kmean iteration
 #define NMAX_THREAD 1024 // depend on gpu
+#define BLOCK_DIM 16
 
 
 class SLIC_cuda {
@@ -47,15 +49,14 @@ private:
     //float4* frameLab_g;
     float* labels_g;
     float* clusters_g;
-    float* accAtt_g;
+    float* accAtt_g; //accumulator for atomic
+	float* accum_map; //accumulator non atomic
 
     //cudaArray
 
     cudaArray* frameBGRA_array;
     cudaArray* frameLab_array;
     cudaArray* labels_array;
-
-
 
     //texture object
     cudaTextureObject_t frameBGRA_tex;
@@ -84,6 +85,8 @@ public:
 
     void Initialize(cv::Mat& frame0);
     void Segment(cv::Mat& frame); // gpu superpixel segmentation
+	void GetLabels();
+	void EnforceConnectivity();
 
     //===== Display function =====
     void displayBound(cv::Mat& image, cv::Scalar colour); // cpu draw

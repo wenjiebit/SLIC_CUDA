@@ -34,38 +34,35 @@ void SLIC_cuda::Initialize(cv::Mat &frame0) {
     getWlHl(m_width, m_height, m_diamSpx, m_wSpx, m_hSpx); // determine w and h of Spx based on diamSpx
     m_areaSpx = m_wSpx*m_hSpx;
     CV_Assert(m_nPx%m_areaSpx==0);
-    m_nSpx = m_nPx/m_areaSpx; // should be an integer!!
-
+    m_nSpx = m_nPx/m_areaSpx; 
     m_clusters = new float[m_nSpx * 5];
     m_labels = new float[m_nPx];
-
     InitBuffers();
-
-
 }
 void SLIC_cuda::Segment(cv::Mat &frame) {
-
+	m_nSpx = m_nPx / m_areaSpx;// should be an integer!!(needed here to reinint because modified in enforce connect)
     SendFrame(frame); //ok
     InitClusters();//ok
-
     for(int i=0; i<N_ITER; i++) {
         Assignement();
-        cudaDeviceSynchronize();
+        //cudaDeviceSynchronize();
         Update();
-        cudaDeviceSynchronize();
+        //cudaDeviceSynchronize();
     }
 	Assignement();
+	//CPU stuff like SIFT computation
+
+	//GetLabels();
+	//EnforceConnectivity();
 }
 
 void SLIC_cuda::InitBuffers() {
 
     //allocate buffers on gpu
-    //gpuErrchk(cudaMalloc((void**)&frameBGRA_g, m_nPx*sizeof(uchar4))); //4 channels for padding
-
     cudaChannelFormatDesc channelDescr = cudaCreateChannelDesc(8,8,8,8,cudaChannelFormatKindUnsigned);
     gpuErrchk(cudaMallocArray(&frameBGRA_array,&channelDescr,m_width,m_height));
 
-    cudaChannelFormatDesc channelDescrLab = cudaCreateChannelDesc(32,32,32,32,cudaChannelFormatKindFloat);
+	cudaChannelFormatDesc channelDescrLab = cudaCreateChannelDesc(8,8,8,8,cudaChannelFormatKindUnsigned);
     gpuErrchk(cudaMallocArray(&frameLab_array,&channelDescrLab,m_width,m_height,cudaArraySurfaceLoadStore));
 
     cudaChannelFormatDesc channelDescrLabels = cudaCreateChannelDesc(32,0,0,0,cudaChannelFormatKindFloat);
@@ -106,12 +103,15 @@ void SLIC_cuda::InitBuffers() {
     resDescLabels.res.array.array = labels_array;
     gpuErrchk(cudaCreateSurfaceObject(&labels_surf, &resDescLabels));
 
-
-
     // buffers clusters , accAtt
     gpuErrchk(cudaMalloc((void**)&clusters_g, m_nSpx*sizeof(float)*5)); // 5-D centroid
     gpuErrchk(cudaMalloc((void**)&accAtt_g, m_nSpx*sizeof(float)*6)); // 5-D centroid acc + 1 counter
     cudaMemset(accAtt_g, 0, m_nSpx*sizeof(float)*6);//initialize accAtt to 0
+
+	//new buffer to avoid atomic
+	float total_pixel_to_search = (float)(m_diamSpx * m_diamSpx * 9);
+	int nBlock_per_spx = (int)ceil(total_pixel_to_search / (float)(BLOCK_DIM * BLOCK_DIM));
+	gpuErrchk(cudaMalloc((void**)&accum_map, m_nSpx*sizeof(float) * 6 * nBlock_per_spx));
 
 }
 
@@ -130,13 +130,93 @@ void SLIC_cuda::SendFrame(cv::Mat& frameBGR){
 
 }
 
+void SLIC_cuda::GetLabels()
+{
+	gpuErrchk(cudaMemcpyFromArray(m_labels, labels_array, 0, 0, m_nPx* sizeof(float), cudaMemcpyDeviceToHost));
+
+	//cudaMemcpyFromArray()
+
+}
+
+
+void SLIC_cuda::EnforceConnectivity()
+{
+	int label = 0, adjlabel = 0;
+	int lims = (m_width * m_height) / (m_nSpx);
+	lims = lims >> 2;
+
+
+	const int dx4[4] = { -1, 0, 1, 0 };
+	const int dy4[4] = { 0, -1, 0, 1 };
+
+	vector<vector<int> >newLabels;
+	for (int i = 0; i < m_height; i++)
+	{
+		vector<int> nv(m_width, -1);
+		newLabels.push_back(nv);
+	}
+
+	for (int i = 0; i < m_height; i++)
+	{
+		for (int j = 0; j < m_width; j++)
+		{
+			if (newLabels[i][j] == -1)
+			{
+				vector<cv::Point> elements;
+				elements.push_back(cv::Point(j, i));
+				for (int k = 0; k < 4; k++)
+				{
+					int x = elements[0].x + dx4[k], y = elements[0].y + dy4[k];
+					if (x >= 0 && x < m_width && y >= 0 && y < m_height)
+					{
+						if (newLabels[y][x] >= 0)
+						{
+							adjlabel = newLabels[y][x];
+						}
+					}
+				}
+				int count = 1;
+				for (int c = 0; c < count; c++)
+				{
+					for (int k = 0; k < 4; k++)
+					{
+						int x = elements[c].x + dx4[k], y = elements[c].y + dy4[k];
+						if (x >= 0 && x < m_width && y >= 0 && y < m_height)
+						{
+							if (newLabels[y][x] == -1 && m_labels[i*m_width+j] == m_labels[y*m_width+x])
+							{
+								elements.push_back(cv::Point(x, y));
+								newLabels[y][x] = label;//m_labels[i][j];
+								count += 1;
+							}
+						}
+					}
+				}
+				if (count <= lims) {
+					for (int c = 0; c < count; c++) {
+						newLabels[elements[c].y][elements[c].x] = adjlabel;
+					}
+					label -= 1;
+				}
+				label += 1;
+			}
+		}
+	}
+	m_nSpx = label;
+	/*for (int i = 0; i < newLabels.size(); i++)
+		for (int j = 0; j < newLabels[i].size(); j++)
+			m_labels[i*m_width+j] = newLabels[i][j];*/
+
+	cudaDeviceSynchronize();
+}
+
+
+
 
 void SLIC_cuda::displayBound(cv::Mat &image, cv::Scalar colour)
 {
     //load label from gpu
-
-    cudaMemcpyFromArray(m_labels,labels_array,0,0,m_nPx* sizeof(float),cudaMemcpyDeviceToHost);
-
+	//GetLabels();
 
     const int dx8[8] = { -1, -1,  0,  1, 1, 1, 0, -1 };
     const int dy8[8] = { 0, -1, -1, -1, 0, 1, 1,  1 };
